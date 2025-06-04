@@ -1,16 +1,21 @@
-import streamlit as st
 import os
-from langchain_community.document_loaders import GithubFileLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter, Language
-from langchain_core.vectorstores import InMemoryVectorStore
-from langchain_pinecone import PineconeVectorStore
-from langchain_openai import OpenAIEmbeddings
+import shutil
+from git import Repo
 from dotenv import load_dotenv
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain.docstore.document import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter, Language
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_pinecone import PineconeVectorStore
+
 from pinecone import Pinecone
+import streamlit as st
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
-# Pinecone is already initialized
+# Initialize Pinecone Connection
 index = Pinecone(api_key=os.getenv("PINECONE_API_KEY")).Index("codebase-rag")
 
 IGNORED_DIRS = {
@@ -78,21 +83,61 @@ def get_text_splitter(file_extension):
 def load_github_docs(repo_owner, repo_name, branch):
     """
     Load documents from the specified GitHub repository.
+    (Refactored to clone locally and read files, rather than using GithubFileLoader.)
     """
-    loader = GithubFileLoader(
-        repo=f"{repo_owner}/{repo_name}",
+    # Construct a local path to clone the repo
+    local_repo_path = os.path.join("repos", f"{repo_owner}_{repo_name}")
+
+    # If it already exists, remove it
+    if os.path.exists(local_repo_path):
+        shutil.rmtree(local_repo_path)
+
+    Repo.clone_from(
+        f"https://github.com/{repo_owner}/{repo_name}.git",
+        local_repo_path,
         branch=branch,
-        github_api_url="https://api.github.com",
-        file_filter=should_load_file,
     )
-    return loader.load()
+
+    docs = []
+    for root, dirs, files in os.walk(local_repo_path):
+        # Filter out ignored directories directly
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+
+        for file_name in files:
+            file_path = os.path.join(root, file_name)
+            relative_path = os.path.relpath(file_path, local_repo_path)
+
+            # Check if we should load this file
+            if not should_load_file(relative_path):
+                continue
+
+            # Determine the file extension to decide text splitting
+            file_extension = os.path.splitext(file_name)[1].lower()
+
+            # Attempt to read the file as UTF-8. If it fails, skip it
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                doc = Document(page_content=content, metadata={"source": relative_path})
+                docs.append(doc)
+
+            except UnicodeDecodeError:
+                # If the file can't be decoded as UTF-8, skip it
+                continue
+            except Exception as e:
+                print(f"Skipping {relative_path} due to error: {e}")
+                continue
+
+    shutil.rmtree(local_repo_path)
+    return docs
 
 
 def split_documents(docs):
     """
     Split documents into smaller chunks based on file type.
     """
-    split_documents = []
+    split_documents_list = []
     skipped_files = 0
 
     for doc in docs:
@@ -102,21 +147,17 @@ def split_documents(docs):
 
         if text_splitter:
             split_docs = text_splitter.split_documents([doc])
-            split_documents.extend(split_docs)
+            split_documents_list.extend(split_docs)
         else:
             skipped_files += 1
 
-    return split_documents, skipped_files
+    return split_documents_list, skipped_files
 
 
-def store_embeddings_in_pinecone(split_documents):
+def store_embeddings_in_pinecone(split_documents, namespace):
     """
     Generate vector embeddings for the split documents and store them in Pinecone.
     """
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise ValueError(
-            "OpenAI API key is missing. Please set it in your environment."
-        )
 
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
@@ -124,10 +165,51 @@ def store_embeddings_in_pinecone(split_documents):
         documents=split_documents,
         embedding=embeddings,
         index_name="codebase-rag",
+        namespace=namespace,
     )
 
 
-st.title("Codebase RAG Assistant: Store Vectors in Pinecone")
+def perform_rag(query, namespace):
+    """
+    Query the Pinecone database and fetch results based on the query.
+    """
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    query_embedding = embeddings.embed_query(query)
+
+    results = index.query(
+        vector=query_embedding, top_k=5, include_metadata=True, namespace=namespace
+    )
+
+    # Build a context string from top 5 matches
+    contexts = []
+    for match in results["matches"]:
+        snippet = match["metadata"].get("text", "")
+        contexts.append(snippet)
+
+    augmented_query = (
+        "<CONTEXT>\n"
+        + "\n\n-------\n\n".join(contexts)
+        + "\n-------\n</CONTEXT>\n\n\nMY QUESTION:\n"
+        + query
+    )
+
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
+
+    messages = [
+        SystemMessage(
+            "You are a Senior Software Engineer. Answer based on the provided context. However, don't mention said context as the end user doesn't know about it."
+        ),
+        HumanMessage(augmented_query),
+    ]
+
+    response = llm.invoke(messages)
+
+    return response.content
+
+
+# Streamlit Interface
+st.set_page_config(page_title="Codebase RAG Assistant", layout="wide")
+st.title("Codebase RAG Assistant")
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -149,19 +231,51 @@ if st.button("Submit"):
                 repo_name = url_parts[4]
                 branch = branch.strip() if branch.strip() else "main"
 
-                # Load documents
+                # Load documents (now clones locally and reads files)
                 docs = load_github_docs(repo_owner, repo_name, branch)
                 st.success(f"Successfully loaded {len(docs)} documents.")
 
+                # Split documents
                 split_docs, skipped_files = split_documents(docs)
                 st.success(f"Code successfully split into {len(split_docs)} chunks.")
                 st.info(f"Skipped {skipped_files} unsupported files.")
 
                 # Store embeddings in Pinecone
-                store_embeddings_in_pinecone(split_docs)
+                namespace = f"{repo_owner}/{repo_name}"
+                store_embeddings_in_pinecone(split_docs, namespace)
                 st.success("Vector embeddings stored in Pinecone successfully.")
+
+                # Store namespace for querying
+                st.session_state.repo_path = f"{repo_owner}/{repo_name}"
 
         except Exception as e:
             st.error(f"An error occurred: {e}")
     else:
         st.warning("Please enter a valid GitHub repository URL.")
+
+# Chat interface
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("Ask about the codebase..."):
+    if "repo_path" not in st.session_state:
+        st.error("Please process a repository first!")
+    else:
+        st.chat_message("user").markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        with st.spinner("Querying Pinecone database..."):
+            try:
+                answer = perform_rag(prompt, st.session_state.repo_path)
+
+                st.chat_message("assistant").markdown(answer)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": answer}
+                )
+
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
